@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.env
+dist/
+build/
+*.xlsx
+*.pdf
+output.txt
+test_extract.py
+debug_header.py
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
