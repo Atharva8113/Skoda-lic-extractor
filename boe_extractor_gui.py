@@ -86,7 +86,7 @@ class BOEExtractorApp:
         self.control_frame = tk.Frame(self.body, bg=LIGHT_BG)
         self.control_frame.pack(fill="x", pady=(0, 25))
 
-        self.upload_btn = tk.Button(self.control_frame, text="Upload BOE PDFs", command=self.select_files,
+        self.upload_btn = tk.Button(self.control_frame, text="Upload PDFs", command=self.select_files,
                                   bg=PRIMARY_BLUE, fg="white", font=("Segoe UI", 11, "bold"),
                                   padx=30, pady=10, relief="flat", cursor="hand2")
         self.upload_btn.pack(side="left")
@@ -214,18 +214,25 @@ class BOEExtractorApp:
             
             # Prioritize matches near "BE" keyword
             if not be_no:
-                # Search specifically for BE No pattern
+                # Add check for checklist Job No
+                m_job = re.search(r'Job No\s+([A-Z0-9/]+-\d+)', text, re.I)
                 m = re.search(r'BE\s*No\.?\s*[|: ]*\s*(\d{7,8})', text, re.I)
-                if m: 
+                
+                if m_job:
+                    be_no = m_job.group(1)
+                elif m: 
                     be_no = m.group(1)
                 elif all_digits:
                     # Fallback to first 7-8 digit number found (usually at top)
                     be_no = all_digits[0]
             
             if not be_date:
-                # Search specifically for BE Date pattern
+                # Check for printed on date in checklist
+                m_print = re.search(r'Printed On\s+(\d{2}-[a-zA-Z]{3}-\d{4})', text, re.I)
                 m = re.search(r'BE\s*Date\s*[|: ]*\s*(\d{2}/\d{2}/\d{4})', text, re.I)
-                if m: 
+                if m_print:
+                    be_date = m_print.group(1)
+                elif m: 
                     be_date = m.group(1)
                 elif all_dates:
                     # Fallback to first date found (usually at top)
@@ -237,6 +244,7 @@ class BOEExtractorApp:
         records = []
         found_section_ever = False
         in_section = False
+        is_checklist = False
         
         lic_no_x = -1
         debit_duty_x = -1
@@ -244,10 +252,13 @@ class BOEExtractorApp:
         
         for page in doc:
             title_rects = page.search_for("F. LICENCE DETAILS")
-            if title_rects:
+            title_rects_chklst = page.search_for("RoDTEP LICENCE DETAILS")
+            
+            if title_rects or title_rects_chklst:
                 found_section_ever = True
                 in_section = True
-                section_y = title_rects[0].y1
+                is_checklist = bool(title_rects_chklst)
+                section_y = title_rects[0].y1 if title_rects else title_rects_chklst[0].y1
             
             if in_section:
                 words = page.get_text("words")
@@ -270,7 +281,8 @@ class BOEExtractorApp:
                     r.sort(key=lambda w: w[0])
                     line_text = " ".join([w[4] for w in r])
                     
-                    if any(x in line_text for x in ["G. RE-EXPORT DETAILS", "H. IGST", "PART - V", "I. IGST", "G.RE-EXPORT DETAILS"]):
+                    # Section Termination Logic: Stop if we hit any subsequent major section header (G-Z)
+                    if re.search(r'^[G-Z]\.\s', line_text.strip(), re.I) or any(x in line_text for x in ["PART - V", "TOTALS", "MODIFIED", "DEALER DETAILS"]):
                         in_section = False
                         break
                     
@@ -303,19 +315,56 @@ class BOEExtractorApp:
                                 "Licence No": lic_val, "Debit Duty": duty_val if duty_val else "0"
                             })
                     else:
-                        if "INVSNO" in line_text or "ITMSNO" in line_text: continue
+                        if any(x in line_text for x in ["INVSNO", "ITMSNO", "INVOICE NO", "S NO", "AMOUNT", "Regn", "Port"]): continue
                         lic_match = re.search(r'([A-Z]\d{9}|\d{10})', line_text)
                         if lic_match:
                             lic_no = lic_match.group(1)
                             if lic_no.startswith("0000"): continue 
+                            
+                            # For greedy matching, ensure we also try to find a decimal amount for duty on the same line
                             ns = re.findall(r'\d+\.\d{2}', line_text)
+                            
+                            # Debit Duty is consistently the last decimal-formatted number on the line for both formats
+                            duty = ns[-1] if ns else "0"
+                                
                             records.append({
                                 "BE Number": be_no, "BE Date": be_date,
-                                "Licence No": lic_no, "Debit Duty": ns[-1] if ns else "0"
+                                "Licence No": lic_no, "Debit Duty": duty
                             })
                 section_y = -1 
                 if not in_section: break
-        return records, found_section_ever
+
+        # Aggregation Logic: Sum Debit Duty for repeating License Numbers within the file
+        if not records:
+            return records, found_section_ever
+            
+        agg_map = {}
+        for r in records:
+            lic = r['Licence No']
+            try:
+                # Clean and convert to float for summing
+                clean_duty = str(r['Debit Duty']).replace(',', '').strip()
+                duty = float(clean_duty) if clean_duty else 0.0
+            except (ValueError, TypeError):
+                duty = 0.0
+            
+            if lic in agg_map:
+                agg_map[lic]['Debit Duty'] += duty
+            else:
+                agg_map[lic] = {
+                    "BE Number": r["BE Number"],
+                    "BE Date": r["BE Date"],
+                    "Licence No": lic,
+                    "Debit Duty": duty
+                }
+        
+        # Convert map to list and format floats back to strings
+        final_records = []
+        for data in agg_map.values():
+            data['Debit Duty'] = f"{data['Debit Duty']:.2f}"
+            final_records.append(data)
+
+        return final_records, found_section_ever
 
     def generate_excel(self):
         if not self.extracted_data: return
